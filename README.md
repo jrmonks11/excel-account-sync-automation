@@ -33,3 +33,13 @@ Example workflow
 Tech Stack
 Python  
 openpyxl
+
+## Example Output
+![Example Output](images/example_output.png)
+
+## Setup
+pip install -r requirements.txt
+
+## Run
+python sync_accounts.py --file "your_workbook.xlsx"
+
