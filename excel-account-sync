@@ -1,0 +1,330 @@
+import argparse
+import datetime as dt
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
+
+# -----------------------------
+# Workbook / sheet conventions
+# -----------------------------
+MASTER_SHEET_NAME = "PhoneMasterSpreadSheet"
+# Monthly ingest sheets: UCJan, UCFeb, UCMar, ...
+MONTHLY_SHEET_PREFIX = "UC"
+
+NINE_DIGIT_RE = re.compile(r"^\d{9}$")
+
+# Color fills
+FILL_UPDATED = PatternFill("solid", fgColor="C6EFCE")    # light green
+FILL_UNMATCHED = PatternFill("solid", fgColor="FFC7CE")  # light red
+FILL_INVALID = PatternFill("solid", fgColor="FFEB9C")    # light yellow
+FILL_LARGE_CHANGE = PatternFill("solid", fgColor="FFD966")  # light orange/yellow
+
+# For when carrier submitts abnormal ammounts.
+# Flag unusually large balance changes 
+LARGE_CHANGE_ABS_THRESHOLD = 500.0  # dollars
+
+
+@dataclass
+class RowRef:
+    row: int
+    acct: str
+
+
+def monthly_sheet_name(for_date: Optional[dt.datetime] = None) -> str:
+    """Return monthly staging sheet name like 'UCMar' for the given date (defaults to now)."""
+    d = for_date or dt.datetime.now()
+    return f"{MONTHLY_SHEET_PREFIX}{d.strftime('%b')}"
+
+
+def normalize_acct(value) -> Optional[str]:
+    """Extract/normalize account number to a 9-digit string, or None if invalid."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    s = re.sub(r"\D", "", s)  # keep digits only (handles hyphens/spaces)
+    return s if NINE_DIGIT_RE.match(s) else None
+
+
+def normalize_money(value) -> Optional[float]:
+    """Best-effort parse numeric balances, return None if blank/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if s == "":
+        return None
+    s = s.replace("$", "").replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def find_col_by_header(ws, header_name: str) -> int:
+    """Find column index by exact header match in row 1."""
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(row=1, column=col).value
+        if v is not None and str(v).strip() == header_name:
+            return col
+    raise ValueError(f"Header '{header_name}' not found in sheet '{ws.title}'.")
+
+
+def build_master_index(ws, acct_col: int, header_row: int = 1) -> Dict[str, RowRef]:
+    """Map 9-digit account -> row in master, without modifying ordering."""
+    idx: Dict[str, RowRef] = {}
+    duplicates: List[str] = []
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        acct = normalize_acct(ws.cell(row=r, column=acct_col).value)
+        if not acct:
+            continue
+        if acct in idx:
+            duplicates.append(acct)
+        else:
+            idx[acct] = RowRef(row=r, acct=acct)
+
+    if duplicates:
+        raise ValueError(
+            f"Duplicate account numbers found in MASTER sheet '{ws.title}': "
+            f"{', '.join(sorted(set(duplicates)))}"
+        )
+
+    return idx
+
+
+def read_staging(
+    ws,
+    acct_col: int,
+    bal_col: int,
+    header_row: int = 1,
+) -> Tuple[Dict[str, float], List[int], List[str]]:
+    """
+    Returns:
+      - mapping acct->balance (last one wins if duplicates; duplicates returned)
+      - list of row numbers with invalid account values
+      - list of duplicate account numbers observed
+    """
+    data: Dict[str, float] = {}
+    invalid_rows: List[int] = []
+    seen: Dict[str, int] = {}
+    duplicates: List[str] = []
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        acct_raw = ws.cell(row=r, column=acct_col).value
+        acct = normalize_acct(acct_raw)
+
+        # If row is blank, ignore; if partially filled with invalid acct, flag.
+        if not acct:
+            row_has_any = any(
+                ws.cell(row=r, column=c).value not in (None, "")
+                for c in range(1, ws.max_column + 1)
+            )
+            if row_has_any:
+                invalid_rows.append(r)
+                ws.cell(row=r, column=acct_col).fill = FILL_INVALID
+            continue
+
+        bal = normalize_money(ws.cell(row=r, column=bal_col).value)
+        # If balance is blank/invalid, skip updating (safer than writing 0).
+        if bal is None:
+            continue
+
+        if acct in seen:
+            duplicates.append(acct)
+        seen[acct] = r
+        data[acct] = bal
+
+    return data, invalid_rows, sorted(set(duplicates))
+
+
+def ensure_sheet(wb, name: str, headers: Optional[List[str]] = None):
+    """Get an existing sheet or create it with optional header row."""
+    if name in wb.sheetnames:
+        ws = wb[name]
+        if headers and ws.max_row < 1:
+            ws.append(headers)
+        return ws
+    ws = wb.create_sheet(name)
+    if headers:
+        ws.append(headers)
+    return ws
+
+
+def autosize_columns(ws):
+    """Simple autosize for readability."""
+    for col in range(1, ws.max_column + 1):
+        max_len = 0
+        for r in range(1, ws.max_row + 1):
+            v = ws.cell(row=r, column=col).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[get_column_letter(col)].width = min(max(10, max_len + 2), 55)
+
+
+def load_sheets(file_path: str, staging_sheet_name: str):
+    wb = load_workbook(file_path)
+
+    if MASTER_SHEET_NAME not in wb.sheetnames:
+        raise ValueError(
+            f"Master sheet '{MASTER_SHEET_NAME}' not found. Available sheets: {wb.sheetnames}"
+        )
+
+    if staging_sheet_name not in wb.sheetnames:
+        raise ValueError(
+            f"Expected monthly ingest sheet '{staging_sheet_name}' not found. "
+            f"Available sheets: {wb.sheetnames}"
+        )
+
+    master = wb[MASTER_SHEET_NAME]
+    staging = wb[staging_sheet_name]
+    return wb, master, staging
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Sync account balances from a monthly UC sheet into the master sheet "
+            f"('{MASTER_SHEET_NAME}') without disturbing master ordering."
+        )
+    )
+    parser.add_argument("--file", required=True, help="Path to .xlsx file")
+    parser.add_argument(
+        "--acct-header",
+        default="Account Number",
+        help="Header text for the account number column (row 1) in both sheets",
+    )
+    parser.add_argument(
+        "--bal-header",
+        default="Balance",
+        help="Header text for the balance column (row 1) in both sheets",
+    )
+    parser.add_argument(
+        "--staging-sheet",
+        default=None,
+        help="Override the monthly sheet name (e.g., UCMar). Default uses current month automatically.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Do not save, only report changes")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output file path (default: overwrite input unless dry-run)",
+    )
+    args = parser.parse_args()
+
+    staging_sheet_name = args.staging_sheet or monthly_sheet_name()
+    wb, master, staging = load_sheets(args.file, staging_sheet_name)
+
+    # Find columns by headers
+    master_acct_col = find_col_by_header(master, args.acct_header)
+    master_bal_col = find_col_by_header(master, args.bal_header)
+
+    staging_acct_col = find_col_by_header(staging, args.acct_header)
+    staging_bal_col = find_col_by_header(staging, args.bal_header)
+
+    # Build indexes / read staging
+    master_index = build_master_index(master, master_acct_col)
+    staging_data, invalid_rows, staging_dupes = read_staging(staging, staging_acct_col, staging_bal_col)
+
+    audit = ensure_sheet(
+        wb,
+        "Audit_Log",
+        headers=["timestamp", "account", "field", "old_value", "new_value", "source_sheet", "source_row", "note"],
+    )
+
+    ts = dt.datetime.now().isoformat(timespec="seconds")
+
+    updated = 0
+    unchanged = 0
+    unmatched_accounts: List[str] = []
+
+    # Apply updates: master is source of truth (we only write the balance field)
+    for acct, new_bal in staging_data.items():
+        if acct not in master_index:
+            unmatched_accounts.append(acct)
+            continue
+
+        r = master_index[acct].row
+        old_val = master.cell(row=r, column=master_bal_col).value
+        old_bal = normalize_money(old_val)
+
+        # Skip no-op updates
+        if old_bal is not None and abs(old_bal - new_bal) < 1e-9:
+            unchanged += 1
+            continue
+
+        # Write new balance
+        master.cell(row=r, column=master_bal_col).value = new_bal
+
+        # Color coding:
+        # - green for normal updates
+        # - orange for unusually large changes
+        note = ""
+        if old_bal is not None and abs(new_bal - old_bal) >= LARGE_CHANGE_ABS_THRESHOLD:
+            master.cell(row=r, column=master_bal_col).fill = FILL_LARGE_CHANGE
+            note = f"Large change (>= {LARGE_CHANGE_ABS_THRESHOLD})"
+        else:
+            master.cell(row=r, column=master_bal_col).fill = FILL_UPDATED
+
+        audit.append([ts, acct, args.bal_header, old_val, new_bal, staging.title, None, note])
+        updated += 1
+
+    # Flag unmatched accounts in staging (red) so they can be reviewed
+    if unmatched_accounts:
+        unmatched_set = set(unmatched_accounts)
+        for r in range(2, staging.max_row + 1):
+            acct = normalize_acct(staging.cell(row=r, column=staging_acct_col).value)
+            if acct and acct in unmatched_set:
+                staging.cell(row=r, column=staging_acct_col).fill = FILL_UNMATCHED
+
+    # Create / refresh summary sheet
+    if "Sync_Summary" in wb.sheetnames:
+        del wb["Sync_Summary"]
+    summary = wb.create_sheet("Sync_Summary")
+    summary.append(["run_timestamp", ts])
+    summary.append(["file", args.file])
+    summary.append(["master_sheet", master.title])
+    summary.append(["monthly_ingest_sheet", staging.title])
+    summary.append(["updated_rows", updated])
+    summary.append(["unchanged_rows", unchanged])
+    summary.append(["unmatched_accounts_count", len(unmatched_accounts)])
+    summary.append(["invalid_staging_rows_count", len(invalid_rows)])
+    summary.append(["duplicate_accounts_in_staging", ", ".join(staging_dupes) if staging_dupes else ""])
+
+    if unmatched_accounts:
+        summary.append([])
+        summary.append(["unmatched_accounts"])
+        for a in sorted(unmatched_accounts):
+            summary.append([a])
+
+    autosize_columns(summary)
+    autosize_columns(audit)
+
+    # Console report
+    print("=== Sync Report ===")
+    print(f"Master sheet: {MASTER_SHEET_NAME}")
+    print(f"Monthly ingest sheet: {staging_sheet_name}")
+    print(f"Updated balances: {updated}")
+    print(f"Unchanged balances: {unchanged}")
+    print(f"Unmatched staging accounts: {len(unmatched_accounts)}")
+    print(f"Invalid staging rows flagged: {len(invalid_rows)}")
+    if staging_dupes:
+        print(f"Duplicate accounts in staging (last wins): {', '.join(staging_dupes)}")
+    print(f"Dry run: {args.dry_run}")
+
+    if args.dry_run:
+        print("Dry-run enabled: no file written.")
+        return
+
+    out_path = args.output if args.output else args.file
+    wb.save(out_path)
+    print(f"Saved: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
